@@ -1,6 +1,8 @@
 import logging
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.openapi.docs import get_swagger_ui_html
 from app.api.routes import router
 from app.core.database import Base, engine
 
@@ -11,6 +13,7 @@ app = FastAPI(
     title="goGig Intelligent Media Processing Pipeline",
     description="Async image upload + heuristic quality/fraud analysis for field vehicle photos.",
     version="1.0.0",
+    docs_url=None,
 )
 
 # Dev convenience: create tables on startup if they don't exist. A real
@@ -20,6 +23,17 @@ app = FastAPI(
 Base.metadata.create_all(bind=engine)
 
 app.include_router(router, prefix="/api/v1", tags=["pipeline"])
+
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+
+
+@app.get("/docs", include_in_schema=False)
+async def custom_docs():
+    return get_swagger_ui_html(
+        openapi_url=app.openapi_url,
+        title="API Documentation",
+        swagger_css_url="/static/swagger-dark.css",
+    )
 
 
 @app.get("/health")

@@ -1,6 +1,6 @@
 import logging
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html
 from app.api.routes import router
@@ -29,11 +29,17 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 @app.get("/docs", include_in_schema=False)
 async def custom_docs():
-    return get_swagger_ui_html(
+    base_html = get_swagger_ui_html(
         openapi_url=app.openapi_url,
         title="API Documentation",
-        swagger_css_url="/static/swagger-dark.css",
     )
+    # Inject our dark theme CSS in addition to (not instead of) Swagger's
+    # own stylesheet, so the base layout still renders correctly.
+    injected = base_html.body.decode("utf-8").replace(
+        "</head>",
+        '<link rel="stylesheet" href="/static/swagger-dark.css"></head>',
+    )
+    return HTMLResponse(content=injected)
 
 
 @app.get("/health")

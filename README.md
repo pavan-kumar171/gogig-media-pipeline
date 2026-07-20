@@ -9,6 +9,24 @@ Built for the Backend + AI Engineering take-home assignment.
 
 ---
 
+## Live Deployment
+
+- **Live API:** https://gogig-media-pipeline.onrender.com
+- **Interactive API docs (Swagger UI):** https://gogig-media-pipeline.onrender.com/docs
+- **Repository:** https://github.com/pavan-kumar171/gogig-media-pipeline
+
+This runs on Render's free tier, which spins the service down after ~15
+minutes of inactivity. **The first request after idle time can take
+30-60 seconds** to respond while it wakes back up - this is a hosting-tier
+characteristic, not an application bug. Subsequent requests are fast.
+
+Note: on this free-tier deployment, the API and worker run inside one
+container (see `entrypoint.sh`) instead of the two separate containers
+`docker-compose.yml` uses locally - this is a hosting-cost trade-off,
+explained in full under Trade-offs below.
+
+---
+
 ## Architecture
 
 ### Service flow
@@ -195,6 +213,14 @@ actually works by running it, not just reading it.
 - Local disk storage instead of S3/GCS (see Architecture).
 - No auth/rate limiting on the API - out of scope per the assignment's
   focus on system design over production hardening, but see below.
+- **The hosted demo link runs API + worker inside one container**
+  (`entrypoint.sh`), not as separate services as `docker-compose.yml`
+  does locally. This is purely a free-hosting-tier constraint (most free
+  tiers give one always-on process; a second worker service costs money)
+  - not a design choice. It means the API and worker share CPU/memory and
+    can't be scaled or restarted independently on the hosted demo, which
+    docker-compose.yml (the "real" architecture) doesn't have. Documented
+    in `entrypoint.sh` itself as well.
 
 **What I'd improve with more time:**
 - A plate-localization step (classical CV contour detection, or a small
@@ -301,13 +327,17 @@ all-white) - these don't need Postgres/Redis running.
 
 ## Sample API Requests/Responses
 
+Captured live from the deployed instance
+(`https://gogig-media-pipeline.onrender.com`) - not a local run.
+
 **Upload:**
 ```bash
-curl -X POST -F "file=@vehicle.jpg" http://localhost:8000/api/v1/uploads
+curl -X POST -F "file=@screenshot.jpg" \
+  https://gogig-media-pipeline.onrender.com/api/v1/uploads
 ```
 ```json
 {
-  "job_id": "e773657c-6ff5-4491-9297-7c2232580f94",
+  "job_id": "54a9a7da-725b-4112-935a-c80052909c70",
   "status": "pending",
   "message": "Upload accepted, processing queued."
 }
@@ -315,39 +345,81 @@ curl -X POST -F "file=@vehicle.jpg" http://localhost:8000/api/v1/uploads
 
 **Status:**
 ```bash
-curl http://localhost:8000/api/v1/jobs/{job_id}/status
+curl https://gogig-media-pipeline.onrender.com/api/v1/jobs/54a9a7da-725b-4112-935a-c80052909c70/status
 ```
 ```json
 {
-  "job_id": "e773657c-6ff5-4491-9297-7c2232580f94",
+  "job_id": "54a9a7da-725b-4112-935a-c80052909c70",
   "status": "completed",
   "retry_count": 0,
-  "created_at": "2026-07-20T09:16:59.169569Z",
-  "updated_at": "2026-07-20T09:17:29.673407Z",
-  "processing_started_at": "2026-07-20T09:17:29.364304Z",
-  "processing_completed_at": "2026-07-20T09:17:29.853369Z",
+  "created_at": "2026-07-20T19:22:16.475590Z",
+  "updated_at": "2026-07-20T19:22:19.651462Z",
+  "processing_started_at": "2026-07-20T19:22:17.184891Z",
+  "processing_completed_at": "2026-07-20T19:22:27.562553Z",
   "failure_reason": null
 }
 ```
 
 **Results:**
 ```bash
-curl http://localhost:8000/api/v1/jobs/{job_id}/results
+curl https://gogig-media-pipeline.onrender.com/api/v1/jobs/54a9a7da-725b-4112-935a-c80052909c70/results
 ```
 ```json
 {
-  "job_id": "e773657c-6ff5-4491-9297-7c2232580f94",
+  "job_id": "54a9a7da-725b-4112-935a-c80052909c70",
   "status": "completed",
-  "overall_confidence": 0.76,
+  "retry_count": 0,
+  "failure_reason": null,
+  "overall_confidence": 0.694,
   "has_issues": true,
   "checks": [
     {
       "check_name": "blur_detection",
+      "passed": false,
+      "severity": "critical",
+      "confidence": 0.81,
+      "message": "Image appears blurry (sharpness score 23.3, threshold 100.0)",
+      "details": { "laplacian_variance": 23.33, "threshold": 100 }
+    },
+    {
+      "check_name": "brightness_analysis",
       "passed": true,
       "severity": "info",
-      "confidence": 0.79,
-      "message": "Image sharpness OK (score 173.1)",
-      "details": {"laplacian_variance": 173.14, "threshold": 100.0}
+      "confidence": 0.85,
+      "message": "Brightness OK (mean intensity 101.8/255)",
+      "details": { "mean_intensity": 101.79 }
+    },
+    {
+      "check_name": "dimension_validation",
+      "passed": true,
+      "severity": "info",
+      "confidence": 1.0,
+      "message": "Resolution OK (1920x1080)",
+      "details": { "width": 1920, "height": 1080 }
+    },
+    {
+      "check_name": "duplicate_detection",
+      "passed": true,
+      "severity": "info",
+      "confidence": 0.9,
+      "message": "No duplicate found among prior uploads",
+      "details": { "phash": "ea6387ce399a4730", "closest_match_job_id": null, "closest_distance": null, "threshold": 5 }
+    },
+    {
+      "check_name": "screenshot_detection",
+      "passed": false,
+      "severity": "warning",
+      "confidence": 0.55,
+      "message": "Image resembles a screenshot or re-saved photo (screen-like aspect ratio + no camera metadata)",
+      "details": { "aspect_ratio": 0.562, "ratio_matches_screen": true, "has_camera_metadata": false }
+    },
+    {
+      "check_name": "suspicious_editing_heuristic",
+      "passed": true,
+      "severity": "info",
+      "confidence": 0.3,
+      "message": "No known editing-tool signature found in EXIF (inconclusive - EXIF is frequently stripped or absent)",
+      "details": { "exif_software_tag": "Windows 11", "matched_marker": null }
     },
     {
       "check_name": "plate_format_validation",
@@ -355,13 +427,18 @@ curl http://localhost:8000/api/v1/jobs/{job_id}/results
       "severity": "warning",
       "confidence": 0.45,
       "message": "No text matching Indian plate format found in image",
-      "details": {"raw_ocr_text": "..."}
+      "details": { "raw_ocr_text": "..." }
     }
   ]
 }
 ```
-(Real output from a live run against this codebase - see AI Usage Disclosure
-above for how it was verified.)
+
+This test image was itself a Windows screenshot (note
+`exif_software_tag: "Windows 11"` above) - `screenshot_detection` correctly
+flagged it using only aspect ratio and missing camera metadata, with no
+external ML model involved. `blur_detection` also correctly caught it as
+low-sharpness. Good live evidence the heuristics behave as designed on a
+real, uncurated input rather than only on synthetic test images.
 
 ---
 

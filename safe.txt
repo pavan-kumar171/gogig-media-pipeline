@@ -1,0 +1,5 @@
+postgresql://gogig_db_user:cBVqPrZvThQreHm4HpvmxmomhuoA8Tcx@dpg-d9f719n7f7vs73c2hv80-a/gogig_db
+
+
+
+redis://red-d9f72jbbc2fs7398mvp0:6379

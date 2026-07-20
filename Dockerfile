@@ -16,7 +16,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 RUN mkdir -p /app/uploads
+RUN chmod +x /app/entrypoint.sh
 
 EXPOSE 8000
 
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Local docker-compose overrides this `command:` per-service (api vs
+# worker run separately - see docker-compose.yml). This default CMD is
+# what free-tier single-container hosts (Render free web service) use:
+# it runs both processes together. See entrypoint.sh for why.
+CMD ["/app/entrypoint.sh"]

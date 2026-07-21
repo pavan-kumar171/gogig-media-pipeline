@@ -11,7 +11,7 @@ Built for the Backend + AI Engineering take-home assignment.
 
 ## Live Deployment
 
-- **Live API:** https://gogig-media-pipeline.onrender.com
+- **Live API:** https://gogig-media-pipeline.onrender.com/docs
 - **Interactive API docs (Swagger UI):** https://gogig-media-pipeline.onrender.com/docs
 - **Repository:** https://github.com/pavan-kumar171/gogig-media-pipeline
 

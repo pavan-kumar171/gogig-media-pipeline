@@ -1,3 +1,57 @@
+# goGig Intelligent Media Processing Pipeline
+
+An async backend that accepts uploaded vehicle images, queues them for background
+analysis, and reports structured, confidence-scored findings on common field-photo
+problems (blur, poor lighting, duplicates, screenshots, tampering signs, invalid
+plate format).
+
+Built for the Backend + AI Engineering take-home assignment.
+
+---
+
+## Live Deployment
+
+- **Live API:** https://gogig-media-pipeline.onrender.com
+- **Interactive API docs (Swagger UI):** https://gogig-media-pipeline.onrender.com/docs
+- **Repository:** https://github.com/pavan-kumar171/gogig-media-pipeline
+
+This runs on Render's free tier, which spins the service down after ~15
+minutes of inactivity. **The first request after idle time can take
+30-60 seconds** to respond while it wakes back up - this is a hosting-tier
+characteristic, not an application bug. Subsequent requests are fast.
+
+Note: on this free-tier deployment, the API and worker run inside one
+container (see `entrypoint.sh`) instead of the two separate containers
+`docker-compose.yml` uses locally - this is a hosting-cost trade-off,
+explained in full under Trade-offs below.
+
+---
+
+## Architecture
+
+### Service flow
+
+Client
+│ POST /api/v1/uploads (multipart file)
+▼
+FastAPI (api process)
+│ 1. validate extension/size
+│ 2. save file to disk, get job_id
+│ 3. INSERT image_jobs row (status=pending)
+│ 4. enqueue Celery task ──────────────┐
+│ 5. return 202 + job_id immediately │
+▼ ▼
+Client polls: Redis (broker)
+GET /jobs/{id}/status │
+GET /jobs/{id}/results ▼
+Celery worker (separate process)
+1. status -> processing
+2. decode image once (OpenCV + PIL)
+3. run 7 independent checks
+4. persist AnalysisCheck rows
+5. status -> completed | failed
+
+
 The API process and the worker process never share memory or a DB session -
 they're separate OS processes (and in Docker, separate containers) that only
 communicate through Postgres (state) and Redis (queue + task metadata). This

@@ -1,58 +1,3 @@
-# goGig Intelligent Media Processing Pipeline
-
-An async backend that accepts uploaded vehicle images, queues them for background
-analysis, and reports structured, confidence-scored findings on common field-photo
-problems (blur, poor lighting, duplicates, screenshots, tampering signs, invalid
-plate format).
-
-Built for the Backend + AI Engineering take-home assignment.
-
----
-
-## Live Deployment
-
-- **Live API:** https://gogig-media-pipeline.onrender.com
-- **Interactive API docs (Swagger UI):** https://gogig-media-pipeline.onrender.com/docs
-- **Repository:** https://github.com/pavan-kumar171/gogig-media-pipeline
-
-This runs on Render's free tier, which spins the service down after ~15
-minutes of inactivity. **The first request after idle time can take
-30-60 seconds** to respond while it wakes back up - this is a hosting-tier
-characteristic, not an application bug. Subsequent requests are fast.
-
-Note: on this free-tier deployment, the API and worker run inside one
-container (see `entrypoint.sh`) instead of the two separate containers
-`docker-compose.yml` uses locally - this is a hosting-cost trade-off,
-explained in full under Trade-offs below.
-
----
-
-## Architecture
-
-### Service flow
-
-```
-Client
-  │  POST /api/v1/uploads  (multipart file)
-  ▼
-FastAPI (api process)
-  │  1. validate extension/size
-  │  2. save file to disk, get job_id
-  │  3. INSERT image_jobs row (status=pending)
-  │  4. enqueue Celery task  ──────────────┐
-  │  5. return 202 + job_id immediately    │
-  ▼                                         ▼
-Client polls:                        Redis (broker)
-  GET /jobs/{id}/status                    │
-  GET /jobs/{id}/results                   ▼
-                                     Celery worker (separate process)
-                                       1. status -> processing
-                                       2. decode image once (OpenCV + PIL)
-                                       3. run 7 independent checks
-                                       4. persist AnalysisCheck rows
-                                       5. status -> completed | failed
-```
-
 The API process and the worker process never share memory or a DB session -
 they're separate OS processes (and in Docker, separate containers) that only
 communicate through Postgres (state) and Redis (queue + task metadata). This
@@ -188,6 +133,10 @@ not just generate it.
   without throwing."
 - Fixed the aspect-ratio bug above based on that live output, not on
   code review alone.
+- Ran all 3 official sample images provided for grading through the
+  live deployed API and inspected the raw JSON for each, which is what
+  surfaced the plate-OCR and screenshot-detection findings documented
+  under Trade-offs below.
 
 **Where I used AI strategically vs. blindly:** I treated AI as a fast way
 to get a reasonable first draft of routine, well-understood patterns
@@ -210,6 +159,19 @@ actually works by running it, not just reading it.
   instead of building a weighting model for a 48-hour assignment.
 - No plate-region cropping means OCR accuracy on real, angled, small
   plates will be noticeably worse than on a clean, cropped plate photo.
+  This was confirmed against all 3 of the official sample images
+  provided for grading: in every case, Tesseract read the auto's ad
+  banner or nearby background text instead of the plate itself,
+  producing a consistent, reproducible failure mode rather than an
+  occasional miss.
+- `screenshot_detection`'s reliance on aspect ratio + missing EXIF also
+  produced false positives on 2 of the 3 official sample images, both
+  shot at the common 720x1280 portrait ratio with EXIF stripped by
+  sharing apps (WhatsApp). This is the same underlying weakness as the
+  4:3 bug caught during development (see AI Usage Disclosure) - the
+  fix in both cases is the same: this heuristic is a weak signal and
+  should be weighted low or gated behind a stronger indicator (e.g.
+  actual on-screen UI artifacts), not aspect ratio alone.
 - Local disk storage instead of S3/GCS (see Architecture).
 - No auth/rate limiting on the API - out of scope per the assignment's
   focus on system design over production hardening, but see below.
@@ -225,7 +187,8 @@ actually works by running it, not just reading it.
 **What I'd improve with more time:**
 - A plate-localization step (classical CV contour detection, or a small
   detection model) before OCR, to make `plate_format_validation`
-  meaningfully more accurate.
+  meaningfully more accurate - the highest-priority fix given it failed
+  consistently across all 3 official sample images.
 - Weighted/learned confidence aggregation instead of a flat mean.
 - Duplicate detection is currently O(n) against every prior job's hash
   (`app/analysis/duplicate.py`) - fine at assignment scale, but at real

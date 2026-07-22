@@ -1,9 +1,9 @@
 # goGig Intelligent Media Processing Pipeline
 
-An async backend that accepts uploaded vehicle images, queues them for background
-analysis, and reports structured, confidence-scored findings on common field-photo
-problems (blur, poor lighting, duplicates, screenshots, tampering signs, invalid
-plate format).
+An async backend that accepts uploaded vehicle images, queues them for
+background analysis, and reports back structured, confidence-scored
+findings on common field-photo problems - things like blur, poor lighting,
+duplicate uploads, screenshots, tampering signs, and invalid plate format.
 
 Built for the Backend + AI Engineering take-home assignment.
 
@@ -11,19 +11,22 @@ Built for the Backend + AI Engineering take-home assignment.
 
 ## Live Deployment
 
-- **Live API:** https://gogig-media-pipeline.onrender.com/docs
+- **Live API:** https://gogig-media-pipeline.onrender.com
 - **Interactive API docs (Swagger UI):** https://gogig-media-pipeline.onrender.com/docs
 - **Repository:** https://github.com/pavan-kumar171/gogig-media-pipeline
 
-This runs on Render's free tier, which spins the service down after ~15
-minutes of inactivity. **The first request after idle time can take
-30-60 seconds** to respond while it wakes back up - this is a hosting-tier
-characteristic, not an application bug. Subsequent requests are fast.
+This is hosted on Render's free tier, which spins the service down after
+about 15 minutes of no activity. So the **first request after some idle
+time can take 30-60 seconds** to respond while it wakes back up - that's
+just how the free tier behaves, not a bug in the app. Everything after
+that first request is fast again.
 
-Note: on this free-tier deployment, the API and worker run inside one
-container (see `entrypoint.sh`) instead of the two separate containers
-`docker-compose.yml` uses locally - this is a hosting-cost trade-off,
-explained in full under Trade-offs below.
+One honest note: on this free-tier deployment, the API and the background
+worker run inside a single container (see `entrypoint.sh`), instead of as
+two separate containers the way `docker-compose.yml` sets them up locally.
+That's purely because a second always-on worker service costs money on
+Render's free tier - not a design choice I'd make in production. More on
+this under Trade-offs below.
 
 ---
 
@@ -31,255 +34,286 @@ explained in full under Trade-offs below.
 
 ### Service flow
 
+Here's how a request moves through the system:
+
+```
 Client
-│ POST /api/v1/uploads (multipart file)
-▼
+  |
+  |  POST /api/v1/uploads  (multipart file)
+  v
 FastAPI (api process)
-│ 1. validate extension/size
-│ 2. save file to disk, get job_id
-│ 3. INSERT image_jobs row (status=pending)
-│ 4. enqueue Celery task ──────────────┐
-│ 5. return 202 + job_id immediately │
-▼ ▼
-Client polls: Redis (broker)
-GET /jobs/{id}/status │
-GET /jobs/{id}/results ▼
-Celery worker (separate process)
-1. status -> processing
-2. decode image once (OpenCV + PIL)
-3. run 7 independent checks
-4. persist AnalysisCheck rows
-5. status -> completed | failed
+  1. validate extension/size
+  2. save file to disk, get job_id
+  3. INSERT image_jobs row (status = pending)
+  4. enqueue Celery task  ------------------+
+  5. return 202 + job_id immediately        |
+                                             v
+Client polls:                          Redis (broker)
+  GET /jobs/{id}/status                     |
+  GET /jobs/{id}/results                    v
+                                  Celery worker (separate process)
+                                    1. status -> processing
+                                    2. decode image once (OpenCV + PIL)
+                                    3. run 7 independent checks
+                                    4. persist AnalysisCheck rows
+                                    5. status -> completed | failed
+```
 
-
-The API process and the worker process never share memory or a DB session -
-they're separate OS processes (and in Docker, separate containers) that only
-communicate through Postgres (state) and Redis (queue + task metadata). This
-is deliberate: it's the same shape you'd deploy at real scale, just with one
-replica per role instead of many.
+The API process and the worker process never share memory or a database
+session - they're separate OS processes (and in Docker, separate
+containers) that only talk to each other through Postgres (for state) and
+Redis (for the job queue). I did this on purpose: it's the same basic
+shape you'd use at real scale, just with one instance of each role instead
+of many.
 
 ### Processing flow (inside the worker)
 
-Each job goes through: `pending -> processing -> completed | failed`. The
-image is decoded **once** (`app/analysis/registry.py:build_context`) into an
-`AnalysisContext` shared read-only across all 7 checks, rather than each
-check re-opening the file. The checks are:
+Every job moves through: `pending -> processing -> completed | failed`.
+
+The image itself is only decoded **once** per job
+(`app/analysis/registry.py:build_context`), into a shared `AnalysisContext`
+object that all 7 checks read from - rather than each check opening the
+file separately. Here's what those 7 checks do:
 
 | Check | What it does |
 |---|---|
-| `blur_detection` | Variance of Laplacian - low variance = few edges = blurry |
-| `brightness_analysis` | Mean pixel intensity - flags too-dark or overexposed |
+| `blur_detection` | Variance of Laplacian - low variance means few sharp edges, which usually means the photo is blurry |
+| `brightness_analysis` | Mean pixel intensity - flags images that are too dark or blown out/overexposed |
 | `dimension_validation` | Rejects images below a minimum resolution |
-| `duplicate_detection` | Perceptual hash (pHash), compared against every prior job's stored hash |
-| `screenshot_detection` | Screen-like aspect ratio **and** missing camera EXIF (both signals required) |
-| `suspicious_editing_heuristic` | EXIF `Software` tag checked against known editor names |
-| `plate_format_validation` | Tesseract OCR over the full frame, regex-matched against Indian plate format |
+| `duplicate_detection` | Perceptual hashing (pHash), compared against every prior job's stored hash |
+| `screenshot_detection` | Looks for a screen-like aspect ratio *and* missing camera EXIF data together |
+| `suspicious_editing_heuristic` | Checks the EXIF "Software" tag against a list of known photo editors |
+| `plate_format_validation` | Tesseract OCR across the frame, checked against the Indian plate format |
 
-Every check returns a `CheckResult` independently (`app/analysis/types.py`).
-One check throwing an exception does **not** kill the others - `run_all_checks`
-catches per-check exceptions and turns them into a `critical`-severity result
-so the failure is visible in the report instead of silently dropped or
+Each check returns its result independently. If one check throws an
+exception, it doesn't take the rest down with it - `run_all_checks` catches
+per-check errors and turns them into a `critical`-severity result, so the
+failure shows up clearly in the report instead of silently vanishing or
 crashing the whole job.
 
-`overall_confidence` is the mean of each check's self-reported confidence;
-`has_issues` is true if any check with severity `warning`/`critical` failed.
-This is intentionally simple - see Trade-offs.
+`overall_confidence` is just the average of each check's own confidence
+score, and `has_issues` is true if any check with `warning` or `critical`
+severity failed. I kept both of these intentionally simple - more on that
+under Trade-offs.
 
-### Queue strategy
+### Why Celery + Redis for the queue
 
-**Celery + Redis**, chosen over an in-memory queue or SQS:
+I went with Celery and Redis over an in-memory queue or SQS, for a few
+reasons:
 
-- **Why not in-memory:** a job enqueued in-process is lost if the API
-  process restarts. Assignment explicitly says async processing "must"
-  happen in the background, and I wanted that to survive a restart, not
-  just look async.
-- **Why not SQS:** no AWS account requirement, and Celery+Redis is fully
-  reproducible with `docker-compose up`, which matters for someone
-  reviewing this on their own machine in 48 hours.
-- **Why Celery specifically (vs BullMQ, given this ended up Python):**
-  it's the standard Python-ecosystem choice, has built-in retry/backoff,
-  `task_acks_late` (task is only ack'd after it completes, so a worker
-  crash mid-processing causes redelivery, not silent loss), and a hard
-  time limit (`task_time_limit=120s`) so a stuck OCR call can't wedge a
-  worker forever.
+- **Not in-memory:** a job sitting in an in-process queue disappears if
+  the API restarts. The assignment specifically asks for async processing
+  that's actually durable, not just non-blocking, so I wanted it to
+  survive a restart.
+- **Not SQS:** it would require an AWS account, and Celery + Redis is
+  fully reproducible with a single `docker-compose up` - which matters a
+  lot for someone reviewing this on their own machine within a 48-hour
+  window.
+- **Celery specifically:** it's the standard choice in the Python
+  ecosystem, comes with retry/backoff built in, and has `task_acks_late`
+  (a task is only marked done after it actually finishes, so if a worker
+  crashes mid-job, the task gets redelivered instead of silently lost). I
+  also set a hard time limit (`task_time_limit=120s`) so a stuck OCR call
+  can't wedge a worker forever.
 
 ### Data model
 
-Two tables, intentionally normalized rather than one JSON blob:
+I used two tables, deliberately normalized instead of dumping everything
+into one JSON blob:
 
-- **`image_jobs`** - one row per upload. Holds status, timestamps, the
+- **`image_jobs`** - one row per upload. Holds the status, timestamps, the
   perceptual hash (indexed, so duplicate lookups don't need to re-read
-  every prior file), retry count, and aggregate confidence/has_issues.
-- **`analysis_checks`** - one row per check per job (1:N). Normalizing
-  this means individual checks are queryable ("how many jobs failed
-  duplicate detection this week") and adding a new check later doesn't
-  touch the schema of existing rows - it's just a new `check_name` value.
+  every prior file from disk), retry count, and the aggregate confidence
+  and has_issues fields.
+- **`analysis_checks`** - one row per check per job. Keeping this
+  normalized means individual checks are queryable on their own (e.g.
+  "how many jobs failed duplicate detection this week"), and adding a new
+  check later doesn't require touching the schema for existing rows - it's
+  just a new `check_name` value.
 
-### Major design decisions
+### A few of the bigger design calls
 
-1. **Local disk storage, not S3.** Storage sits behind a tiny `LocalStorage`
-   class (`app/storage/local_storage.py`) specifically so swapping in S3
-   later is a one-file change. For a 48-hour take-home with a reviewer
-   running this locally, adding real cloud storage credentials would add
-   setup friction without adding signal about my engineering judgment.
-2. **Whole-frame OCR, not plate-region detection.** A production system
-   would run a plate-localization model (or at least edge/contour-based
-   plate cropping) before OCR. I chose whole-frame OCR because it's
-   honest about what it can and can't do (see the docstring in
-   `plate_ocr.py`) rather than pretending a heavier pipeline exists.
-3. **Confidence scores are heuristic self-reports, not calibrated
-   probabilities.** Each check assigns its own confidence based on how
-   far a metric sits from its threshold. This is explicitly *not* a
-   trained/calibrated model output - it's a way to communicate "how sure
-   is this specific heuristic" rather than presenting binary pass/fail as
-   if it were ground truth. Documented per-check in code comments.
+1. **Local disk storage instead of S3.** Storage sits behind a small
+   `LocalStorage` class (`app/storage/local_storage.py`) specifically so
+   swapping in S3 later is a one-file change, not a rewrite. For a
+   48-hour take-home where someone needs to run this on their own
+   machine, adding real cloud storage credentials felt like it would add
+   setup friction without really showing anything about my engineering
+   judgment.
+2. **Whole-frame OCR instead of plate-region detection.** A production
+   system would first run a plate-localization step (a small detection
+   model, or at least contour-based cropping) before handing the crop to
+   OCR. I went with whole-frame OCR instead, and I'd rather be upfront
+   about what that can and can't do (see the docstring in `plate_ocr.py`
+   and the Trade-offs section below) than pretend a heavier pipeline
+   exists when it doesn't.
+3. **Confidence scores are self-reported heuristic estimates, not
+   calibrated probabilities.** Each check works out its own confidence
+   based on how far a metric sits from its threshold. This is *not* the
+   output of a trained/calibrated model - it's just a way to say "here's
+   roughly how sure this particular heuristic is" instead of presenting a
+   binary pass/fail as if it were ground truth.
 
 ---
 
 ## AI Usage Disclosure (Mandatory)
 
-I built this collaborating with Claude (Claude Sonnet 4.6, via Claude.ai)
-inside a sandboxed dev environment where I could actually run the code,
-not just generate it.
+I built this working alongside Claude (Claude Sonnet 4.6, via Claude.ai),
+inside a sandboxed environment where I could actually run the code as it
+was being written, not just generate it and hope.
 
 **Where AI helped:**
-- Scaffolding the FastAPI/Celery/SQLAlchemy project structure and
-  boilerplate (routes, models, Celery task wiring) faster than typing it
-  by hand.
-- Drafting the 7 heuristic checks (blur/brightness/duplicate/screenshot/
-  metadata/plate OCR) with initial threshold values.
-- Writing the docstrings that explain *why* each heuristic works the way
-  it does, and the trade-offs section below.
+- Scaffolding the FastAPI/Celery/SQLAlchemy project structure and the
+  routine boilerplate (routes, models, Celery task wiring) - faster than
+  typing all of it out by hand.
+- Drafting the 7 heuristic checks (blur, brightness, duplicate,
+  screenshot, metadata, plate OCR) along with a first pass at threshold
+  values.
+- Writing the docstrings explaining *why* each heuristic works the way it
+  does, and drafting this trade-offs section.
 - Generating unit tests for the pure-function checks.
 
 **Where AI output was wrong, and how I caught it:**
-- The initial `screenshot_detection` heuristic included **4:3 (3, 4)** in
-  its list of "screen-like" aspect ratios. 4:3 is also the standard
-  camera sensor ratio, so this made the check flag almost every normal
-  photo as a suspected screenshot. This wasn't caught by reading the
-  code - it only showed up when I actually ran the pipeline end-to-end
-  against synthetic test images and looked at the output: every single
-  seeded image (including plain camera-ratio photos) was failing
-  `screenshot_detection`. I removed 4:3 from the ratio list and
-  re-verified with a direct unit check that a standard 1024x768 image no
-  longer trips the heuristic. This is exactly the kind of bug that looks
-  fine on read-through and only surfaces under actual execution - which
-  is why I ran a live end-to-end test (uploaded a real file through the
-  API, polled results, inspected the JSON) rather than trusting generated
-  code on sight.
-- Celery's `autoretry_for` + manual `retries >= max_retries` check in
-  `process_image.py` needed a second look: the naive version would have
-  either double-marked jobs as failed or swallowed the final failure
-  reason. I validated the retry/failure-persistence logic by reading
-  through the state transitions manually rather than assuming the
-  AI-suggested retry pattern was correct out of the box.
+- The first version of `screenshot_detection` included 4:3 (i.e. 3:4) in
+  its list of "screen-like" aspect ratios. Problem is, 4:3 is *also* the
+  standard camera sensor ratio, so this made the check flag almost every
+  normal photo as a suspected screenshot. This wasn't something I caught
+  by reading the code - it only showed up once I actually ran the
+  pipeline end-to-end against test images and looked at the real output:
+  every single seeded image, including plain camera-ratio ones, was
+  failing `screenshot_detection`. I removed 4:3 from the ratio list and
+  double-checked with a direct test that a normal 1024x768 photo no
+  longer trips the heuristic. It's exactly the kind of bug that looks
+  totally fine on a read-through and only shows up once you actually run
+  it - which is why I made a point of running real end-to-end tests
+  (uploading an actual file through the API, polling for results,
+  reading the JSON) instead of trusting generated code just because it
+  compiled.
+- Celery's `autoretry_for`, combined with the manual
+  `retries >= max_retries` check in `process_image.py`, needed a second
+  look - the first version would have either double-marked jobs as failed
+  or lost the actual failure reason. I went through the state transitions
+  by hand to make sure retry and failure-persistence logic actually did
+  what I wanted, rather than assuming the AI's first suggestion was right.
+- When I ran the 3 official grading sample images through the live
+  deployed API (not just my own test images), the plate OCR check missed
+  the plate on all three, and the screenshot check false-flagged two of
+  them. Neither is a bug exactly - they're the same class of limitation
+  as the aspect-ratio issue above, just showing up on real-world photos
+  instead of synthetic test images. Both are called out explicitly under
+  Trade-offs, with the actual images and results included below.
 
 **How I validated AI-generated code, generally:**
-- Ran the actual API (`uvicorn`) and worker (`celery`) against real
-  Postgres/Redis instances, not just imported the modules.
-- Uploaded real files through `curl`, polled `/status` and `/results`,
-  and read the actual JSON output for each of the 7 checks rather than
-  assuming they worked because the code compiled.
-- Wrote and ran the `pytest` suite (`tests/test_analysis_checks.py`)
-  against deliberately constructed edge-case inputs (flat gray image,
-  random noise, all-black, all-white) to confirm each heuristic's
-  pass/fail boundary actually behaves as documented, not just "runs
-  without throwing."
-- Fixed the aspect-ratio bug above based on that live output, not on
-  code review alone.
-- Ran all 3 official sample images provided for grading through the
-  live deployed API and inspected the raw JSON for each, which is what
-  surfaced the plate-OCR and screenshot-detection findings documented
-  under Trade-offs below.
+- Ran the real API (`uvicorn`) and worker (`celery`) against actual
+  Postgres and Redis instances, not just imported the modules and assumed
+  they'd work.
+- Uploaded real files through `curl`, polled `/status` and `/results`, and
+  read the actual JSON that came back for each of the 7 checks, instead
+  of assuming things worked just because the code ran without errors.
+- Wrote and ran a `pytest` suite (`tests/test_analysis_checks.py`) against
+  deliberately constructed edge cases - a flat gray image, random noise,
+  all-black, all-white - to confirm each heuristic's pass/fail boundary
+  actually behaves the way its docstring claims, not just "doesn't
+  crash."
+- Ran all 3 of the official sample images provided for grading through
+  the live deployed API and read the raw JSON for each one - this is
+  what actually surfaced the plate-OCR and screenshot-detection
+  limitations documented below, not a hypothetical concern I guessed at.
 
-**Where I used AI strategically vs. blindly:** I treated AI as a fast way
-to get a reasonable first draft of routine, well-understood patterns
-(REST CRUD, Celery task wiring, ORM models) so I could spend my own
-attention on the parts that actually needed engineering judgment: which
-heuristics to combine and why, what confidence scores mean, how failure
-states should be surfaced, and - critically - verifying the thing
-actually works by running it, not just reading it.
+**Where I leaned on AI vs. did it myself:** I used AI as a fast way to get
+a solid first draft on the routine, well-understood parts - REST CRUD,
+Celery wiring, ORM models - so I could spend my own attention on the parts
+that actually needed judgment: which heuristics to combine and why, what
+the confidence scores should mean, how failure states get surfaced to the
+caller, and - the part I think mattered most - actually verifying the
+thing works by running it against real images, not just reading the code
+and assuming it's fine.
 
 ---
 
 ## Trade-offs
 
-**What I intentionally simplified:**
-- Whole-frame OCR instead of plate-region detection (see above).
-- `overall_confidence` is an unweighted mean across checks. A real system
-  would weight checks by how reliable they are (blur/dimensions are near-
-  deterministic; screenshot/tamper heuristics are weak signals) - I kept
-  it simple and documented the weak checks' low self-reported confidence
-  instead of building a weighting model for a 48-hour assignment.
+**What I intentionally kept simple:**
+- Whole-frame OCR instead of plate-region detection (explained above).
+- `overall_confidence` is a flat, unweighted average across all 7 checks.
+  A more careful system would weight the checks differently, since some
+  are near-deterministic (blur, dimensions) and others are genuinely weak
+  signals (screenshot, tamper detection). For a 48-hour assignment I kept
+  the aggregation simple and instead made sure the weaker checks report
+  low confidence on their own, rather than building a whole weighting
+  model.
 - No plate-region cropping means OCR accuracy on real, angled, small
-  plates will be noticeably worse than on a clean, cropped plate photo.
-  This was confirmed against all 3 of the official sample images
-  provided for grading: in every case, Tesseract read the auto's ad
-  banner or nearby background text instead of the plate itself,
-  producing a consistent, reproducible failure mode rather than an
-  occasional miss.
-- `screenshot_detection`'s reliance on aspect ratio + missing EXIF also
-  produced false positives on 2 of the 3 official sample images, both
-  shot at the common 720x1280 portrait ratio with EXIF stripped by
-  sharing apps (WhatsApp). This is the same underlying weakness as the
-  4:3 bug caught during development (see AI Usage Disclosure) - the
-  fix in both cases is the same: this heuristic is a weak signal and
-  should be weighted low or gated behind a stronger indicator (e.g.
-  actual on-screen UI artifacts), not aspect ratio alone.
-- Local disk storage instead of S3/GCS (see Architecture).
-- No auth/rate limiting on the API - out of scope per the assignment's
-  focus on system design over production hardening, but see below.
-- **The hosted demo link runs API + worker inside one container**
-  (`entrypoint.sh`), not as separate services as `docker-compose.yml`
-  does locally. This is purely a free-hosting-tier constraint (most free
-  tiers give one always-on process; a second worker service costs money)
-  - not a design choice. It means the API and worker share CPU/memory and
-    can't be scaled or restarted independently on the hosted demo, which
-    docker-compose.yml (the "real" architecture) doesn't have. Documented
-    in `entrypoint.sh` itself as well.
+  plates is noticeably worse than on a clean, close-up plate photo. This
+  wasn't just theoretical - it showed up clearly against all 3 official
+  sample images (see below): in every case, Tesseract read text off the
+  auto-rickshaw's ad banner instead of the actual plate, which is a small
+  and hard-to-read part of the frame in these photos. That's a
+  consistent, reproducible failure mode, not an occasional miss.
+- `screenshot_detection`'s reliance on aspect ratio plus missing EXIF
+  data also produced false positives on 2 of the 3 official samples, both
+  shot at the common 720x1280 portrait ratio with EXIF stripped out by
+  WhatsApp before I even received them. It's the same underlying
+  weakness as the 4:3 bug I caught during development (see AI Usage
+  Disclosure above) - aspect ratio alone is just too weak a signal on its
+  own, and this heuristic should either carry lower weight in aggregate
+  scoring or be paired with a stronger indicator, like actually detecting
+  on-screen UI elements.
+- Local disk storage instead of S3/GCS (see Architecture above).
+- No authentication or rate limiting on the API - left out of scope,
+  given the assignment's focus on system design over production
+  hardening, but noted here rather than left unmentioned.
+- The hosted demo runs the API and worker inside one container
+  (`entrypoint.sh`) rather than as two separate services the way
+  `docker-compose.yml` does locally. This is a free-tier hosting
+  constraint, not a design decision - most free tiers give you exactly
+  one always-on process, and a second worker service costs money. It
+  means the API and worker share CPU/memory on the hosted demo and can't
+  be restarted or scaled independently there, which the "real"
+  architecture in `docker-compose.yml` doesn't have this limitation.
 
 **What I'd improve with more time:**
-- A plate-localization step (classical CV contour detection, or a small
-  detection model) before OCR, to make `plate_format_validation`
-  meaningfully more accurate - the highest-priority fix given it failed
-  consistently across all 3 official sample images.
-- Weighted/learned confidence aggregation instead of a flat mean.
-- Duplicate detection is currently O(n) against every prior job's hash
-  (`app/analysis/duplicate.py`) - fine at assignment scale, but at real
-  volume this needs an indexed nearest-neighbor structure (e.g. an
-  LSH/vector index) instead of a linear scan.
+- A plate-localization step before OCR (classical CV contour detection,
+  or a small detection model) - this is the highest-priority fix, given
+  it failed consistently across all 3 official samples.
+- Weighted or learned confidence aggregation instead of a flat average.
+- Duplicate detection currently does an O(n) scan against every prior
+  job's hash (`app/analysis/duplicate.py`) - completely fine at
+  assignment scale, but at real volume this would need an indexed
+  nearest-neighbor structure (an LSH or vector index) instead of a linear
+  scan.
 - API-level authentication and per-client rate limiting.
-- A `/jobs` listing endpoint with pagination/filtering (only single-job
-  status/results are implemented, per the assignment's minimum scope).
-- Structured JSON logging + a correlation ID threaded from the upload
-  request through to the worker log lines, for real observability.
+- A `/jobs` listing endpoint with pagination and filtering (only
+  single-job status/results are implemented, matching the assignment's
+  minimum scope).
+- Structured JSON logging plus a correlation ID threaded from the upload
+  request through to the worker's log lines, for actual observability.
 
 **Scalability concerns:**
-- Celery workers scale horizontally trivially (just run more worker
-  containers) since they're stateless besides their DB/Redis
-  connections - `worker_prefetch_multiplier=1` in `celery_app.py` is set
-  so tasks are distributed fairly across workers instead of one worker
-  hoarding a batch.
+- Celery workers scale out horizontally pretty easily - just run more
+  worker containers - since they're stateless apart from their DB/Redis
+  connections. `worker_prefetch_multiplier=1` in `celery_app.py` is set
+  so tasks get spread fairly across workers instead of one worker
+  hoarding a whole batch.
 - The real bottleneck at scale is `duplicate_detection`'s linear scan
   over all prior hashes, called out above.
 - Local disk storage doesn't scale across multiple worker/API replicas
-  on different hosts - this is the concrete reason the storage layer is
-  behind an interface, so it's a real blocker to flag rather than a
-  hypothetical one.
+  running on different hosts - this is the actual, concrete reason the
+  storage layer sits behind an interface, not a hypothetical concern.
 
 **Failure handling concerns:**
-- Celery `autoretry_for` + `retry_backoff` retries transient failures
-  (e.g. a flaky decode) up to `max_task_retries` (3) with exponential
-  backoff before marking the job `failed` with a stored reason,
-  queryable via `/jobs/{id}/status`.
-- `task_acks_late=True` means a worker that crashes mid-task doesn't lose
-  the task - Redis redelivers it to another worker.
-- What's **not** handled: if enqueueing to Redis itself fails right after
-  the DB commit (`app/api/routes.py`), the job row exists but never gets
-  picked up - it's stuck at `pending` forever. A production system needs
-  a reconciler sweeping jobs `pending` longer than N minutes and
-  re-enqueuing them. Flagged in code comments, not implemented, given
-  the assignment's time box.
+- Celery's `autoretry_for` and `retry_backoff` retry transient failures
+  (like a flaky decode) up to `max_task_retries` (3 attempts) with
+  exponential backoff, before finally marking the job `failed` with a
+  stored reason you can see via `/jobs/{id}/status`.
+- `task_acks_late=True` means a worker crashing mid-task doesn't lose the
+  task - Redis redelivers it to another worker instead.
+- What's **not** handled: if enqueueing to Redis fails right after the
+  database commit (`app/api/routes.py`), the job row exists but never
+  actually gets picked up - it just sits at `pending` forever. A
+  production system would need a reconciler process sweeping up jobs that
+  have been `pending` for longer than some threshold and re-enqueuing
+  them. I flagged this in code comments rather than building it, given
+  the time constraints.
 
 ---
 
@@ -291,15 +325,16 @@ actually works by running it, not just reading it.
 docker-compose up --build
 ```
 
-This starts Postgres, Redis, the API (port 8000), and a Celery worker.
-Tables are created automatically on API startup.
+This starts Postgres, Redis, the API (on port 8000), and a Celery worker
+all together. Tables get created automatically on API startup.
 
 API docs: http://localhost:8000/docs
 
 ### Option B: Run locally without Docker
 
-Requires: Python 3.12+, PostgreSQL, Redis, and the `tesseract-ocr` system
-package (`apt install tesseract-ocr` / `brew install tesseract`).
+You'll need Python 3.12+, PostgreSQL, Redis, and the `tesseract-ocr`
+system package (`apt install tesseract-ocr` on Linux, or
+`brew install tesseract` on Mac).
 
 ```bash
 python -m venv venv && source venv/bin/activate
@@ -319,16 +354,16 @@ celery -A app.tasks.celery_app worker --loglevel=info
 
 ### Seed sample data
 
-With the stack running:
+With everything running:
 
 ```bash
 python scripts/seed.py
 ```
 
-Uploads 5 synthetic test images (sharp, blurry, duplicate, dark,
-screenshot-shaped) and prints each one's findings once processed - a fast
-way to see all 7 checks produce real output without needing your own
-vehicle photos.
+This uploads 5 synthetic test images (sharp, blurry, duplicate, dark,
+screenshot-shaped) and prints out each one's findings once they're
+processed - a quick way to see all 7 checks produce real output without
+needing your own vehicle photos on hand.
 
 ### Run tests
 
@@ -336,16 +371,17 @@ vehicle photos.
 pytest tests/ -v
 ```
 
-Unit tests cover the pure-function heuristics (blur/brightness/dimensions)
-against constructed edge cases (flat image, random noise, all-black,
-all-white) - these don't need Postgres/Redis running.
+The unit tests cover the pure-function heuristics (blur, brightness,
+dimensions) against deliberately constructed edge cases - a flat image,
+random noise, all-black, all-white. They don't need Postgres or Redis
+running.
 
 ---
 
 ## Sample API Requests/Responses
 
 Captured live from the deployed instance
-(`https://gogig-media-pipeline.onrender.com`) - not a local run.
+(`https://gogig-media-pipeline.onrender.com`), not a local run.
 
 **Upload:**
 ```bash
@@ -450,27 +486,114 @@ curl https://gogig-media-pipeline.onrender.com/api/v1/jobs/54a9a7da-725b-4112-93
 }
 ```
 
-This test image was itself a Windows screenshot (note
-`exif_software_tag: "Windows 11"` above) - `screenshot_detection` correctly
-flagged it using only aspect ratio and missing camera metadata, with no
-external ML model involved. `blur_detection` also correctly caught it as
-low-sharpness. Good live evidence the heuristics behave as designed on a
-real, uncurated input rather than only on synthetic test images.
+This particular test image was actually a Windows screenshot (notice
+`exif_software_tag: "Windows 11"` in the response above) -
+`screenshot_detection` correctly flagged it using nothing but aspect ratio
+and missing camera metadata, with no external ML model involved.
+`blur_detection` also correctly caught it as low-sharpness. Good live
+evidence the heuristics behave the way they're designed to on a real,
+uncurated input, not just on synthetic test images.
+
+---
+
+## Test Results - Official Sample Images
+
+The 3 images below were provided for grading and run end-to-end through
+the live deployed system (upload -> queue -> analysis -> results), using
+the exact same code path a real user's request would hit.
+
+### Sample Image 1 - Pune auto-rickshaw, Arena Animation ad
+
+![Sample 1](docs/sample-images/sample-1-pune-arena.jpg)
+
+**Result:** `status: completed` | `overall_confidence: 0.721` | `has_issues: true`
+
+| Check | Result | Notes |
+|---|---|---|
+| blur_detection | Passed | Sharpness score 1334.3, well above the threshold |
+| brightness_analysis | Passed | Mean intensity 121.2/255 |
+| dimension_validation | Passed | 960x1280 |
+| duplicate_detection | Passed | No match found among prior uploads |
+| screenshot_detection | Passed | Standard 4:3-ish ratio, correctly not flagged |
+| suspicious_editing_heuristic | Passed | No EXIF Software tag present |
+| plate_format_validation | **Flagged** | No valid Indian plate text found |
+
+The plate wasn't found here mainly because it's a rear-of-vehicle ad shot,
+not a close-up of the plate itself - the actual plate is small in the
+frame and partly obscured, which is exactly the kind of shot the
+whole-frame-OCR approach struggles with (see Trade-offs above).
+
+### Sample Image 2 - Pune auto-rickshaw, CNG badge
+
+![Sample 2](docs/sample-images/sample-2-pune-cng.jpg)
+
+**Result:** `status: completed` | `overall_confidence: 0.714` | `has_issues: true`
+
+| Check | Result | Notes |
+|---|---|---|
+| blur_detection | Passed | Sharpness score 1471.8 |
+| brightness_analysis | Passed | Mean intensity 116.7/255 |
+| dimension_validation | Passed | 720x1280 |
+| duplicate_detection | Passed | No match found among prior uploads |
+| screenshot_detection | **Flagged** | Tall aspect ratio + no camera EXIF |
+| suspicious_editing_heuristic | Passed | No EXIF Software tag present |
+| plate_format_validation | **Flagged** | No valid Indian plate text found |
+
+The `screenshot_detection` flag here is a real limitation, not a random
+miss - this photo happens to share a 720x1280 portrait aspect ratio with
+common phone screenshots, and WhatsApp strips EXIF data before I ever
+received the file. Both signals lined up even though this is obviously a
+real photo, not a screenshot. This is the same underlying weakness
+documented in the AI Usage Disclosure and Trade-offs sections above.
+
+### Sample Image 3 - Chennai auto-rickshaw, Dr Agarwal's Eye Hospital ad
+
+![Sample 3](docs/sample-images/sample-3-chennai-dragarwals.jpg)
+
+**Result:** `status: completed` | `overall_confidence: 0.714` | `has_issues: true`
+
+| Check | Result | Notes |
+|---|---|---|
+| blur_detection | Passed | Sharpness score 568.9 |
+| brightness_analysis | Passed | Mean intensity 106.8/255 |
+| dimension_validation | Passed | 720x1280 |
+| duplicate_detection | Passed | No match found among prior uploads |
+| screenshot_detection | **Flagged** | Same tall aspect ratio + no camera EXIF pattern as Image 2 |
+| suspicious_editing_heuristic | Passed | No EXIF Software tag present |
+| plate_format_validation | **Flagged** | No valid Indian plate text found |
+
+Same story as Image 2 - the 720x1280 aspect ratio plus stripped EXIF data
+triggers the same false positive. This image also has a geotag overlay
+baked into the photo itself (visible at the bottom), which is a nice
+example of the kind of visual noise that whole-frame OCR has to compete
+with when trying to find plate text.
+
+### What these 3 results actually show
+
+None of the 3 official samples got a valid plate match, and 2 of 3 were
+flagged by the screenshot heuristic. I want to be upfront that this isn't
+a great look at first glance - but I think it's more useful to show real
+results honestly than to cherry-pick easier test images. Both limitations
+are fully explained above, are consistent and reproducible rather than
+random, and point at the same root causes: whole-frame OCR isn't a
+substitute for actual plate localization, and aspect-ratio-based
+screenshot detection is a weak signal on its own. Both are called out as
+the top priorities under "What I'd improve with more time."
 
 ---
 
 ## Assumptions
 
-- "Duplicate" means visually near-identical (perceptual hash match), not
-  byte-identical - field uploads are frequently re-compressed/re-saved
-  before reaching the API.
-- Indian plate format only (per the assignment's problem context: vehicle
-  images), matched as `[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}` after
-  stripping whitespace/punctuation.
-- A single uploaded file per request (no batch upload endpoint) - the
+- "Duplicate" means visually near-identical (a perceptual hash match), not
+  byte-identical - field uploads get re-compressed or re-saved fairly
+  often before they reach the API.
+- Indian plate format only (matching the assignment's vehicle-image
+  context), matched as `[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}` after
+  stripping whitespace and punctuation.
+- One uploaded file per request - no batch upload endpoint, since the
   assignment's example flows are all single-image.
-- "Processing failed" is reserved for genuine processing errors (corrupt
-  file, decode failure, exhausted retries) - a *detected issue* (blurry,
-  duplicate, etc.) is a successful analysis that found a problem, not a
-  failure state. This distinction is why `has_issues` is a separate field
-  from `status`.
+- "Processing failed" is reserved for genuine processing errors (a
+  corrupt file, a decode failure, retries exhausted) - a *detected issue*
+  like blur or a duplicate is a successful analysis that happened to find
+  a problem, not a failure state. That's why `has_issues` is a separate
+  field from `status` rather than folded into it.

@@ -1,5 +1,6 @@
 import logging
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.openapi.docs import get_swagger_ui_html
@@ -16,6 +17,16 @@ app = FastAPI(
     docs_url=None,
 )
 
+# Allow browser-based frontends (like the upload page) to call this API
+# from any origin, since it's served from a different address than this
+# backend.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 # Dev convenience: create tables on startup if they don't exist. A real
 # production setup would use Alembic migrations instead (not implemented
 # here - see README trade-offs) so schema changes are versioned and
@@ -23,7 +34,6 @@ app = FastAPI(
 Base.metadata.create_all(bind=engine)
 
 app.include_router(router, prefix="/api/v1", tags=["pipeline"])
-
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 

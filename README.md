@@ -1,4 +1,4 @@
-# goGig Intelligent Media Processing Pipeline
+#  Intelligent Media Processing Pipeline
 
 An async backend that accepts uploaded vehicle images, queues them for
 background analysis, and reports back structured, confidence-scored
